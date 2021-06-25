@@ -539,14 +539,13 @@ function(add_systemtest_from_directory tests_basedir prefix test_subdir)
   #
   # Multiple tests in this directory.
   #
-  if(EXISTS "${test_dir}/test-setup")
-    add_systemtest("${test_basename}:setup" "${test_dir}/test-setup")
-  else()
-    add_systemtest(
-      "${test_basename}:setup" "${PROJECT_BINARY_DIR}/scripts/start_bareos.sh"
-      WORKING_DIRECTORY ${test_dir}
+  if(NOT EXISTS "${test_dir}/test-setup")
+    create_symlink(
+      "${PROJECT_BINARY_DIR}/scripts/start_bareos.sh" "${test_dir}/test-setup"
     )
   endif()
+  add_systemtest("${test_basename}:setup" "${test_dir}/test-setup")
+
   set_tests_properties(
     "${test_basename}:setup" PROPERTIES FIXTURES_SETUP
                                         "${test_basename}-fixture"
@@ -570,14 +569,13 @@ function(add_systemtest_from_directory tests_basedir prefix test_subdir)
     )
   endforeach()
 
-  if(EXISTS ${test_dir}/test-cleanup)
-    add_systemtest(${test_basename}:cleanup "${test_dir}/test-cleanup")
-  else()
-    add_systemtest(
-      ${test_basename}:cleanup "${PROJECT_BINARY_DIR}/scripts/cleanup"
-      WORKING_DIRECTORY ${test_dir}
+  if(NOT EXISTS ${test_dir}/test-cleanup)
+    create_symlink(
+      "${PROJECT_BINARY_DIR}/scripts/cleanup" "${test_dir}/test-cleanup"
     )
   endif()
+  add_systemtest(${test_basename}:cleanup "${test_dir}/test-cleanup")
+
   set_tests_properties(
     ${test_basename}:cleanup PROPERTIES FIXTURES_CLEANUP
                                         "${test_basename}-fixture"

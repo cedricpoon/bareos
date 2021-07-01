@@ -1,11 +1,8 @@
 if(TARGET python-fd)
-  check_pymodule_available(2 psycopg2)
-  check_pymodule_available(2 dateutil)
-  if(PYMODULE_2_PSYCOPG2_FOUND AND PYMODULE_2_DATEUTIL_FOUND)
-    create_systemtest(${SYSTEMTEST_PREFIX} "py2plug-fd-postgres")
-  else()
-    create_systemtest(${SYSTEMTEST_PREFIX} "py2plug-fd-postgres" DISABLED)
-  endif()
+  message(
+    "disabling py2plug-fd-postgres, Python2 not supported for this plugin"
+  )
+  create_systemtest(${SYSTEMTEST_PREFIX} "py2plug-fd-postgres" DISABLED)
 endif()
 
 if(TARGET python3-fd)

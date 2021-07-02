@@ -66,8 +66,6 @@ endif()
 
 # Main starts here...
 
-find_program(FALSE_BIN false)
-
 find_program(PG_CTL pg_ctl /usr/lib/postgresql/*/bin /usr/bin /bin)
 get_filename_component(POSTGRES_BIN_PATH ${PG_CTL} DIRECTORY)
 # message(STATUS "PG_CTL is ${PG_CTL}")
@@ -275,9 +273,7 @@ if(ENABLE_WEBUI_SELENIUM_TEST)
 else()
   set(WEBUI_SELENIUM_TESTS)
   foreach(TEST_NAME_DISABLED ${AVAILABLE_WEBUI_SELENIUM_TESTS})
-    add_test(NAME ${WEBUI_TEST_PREFIX}${TEST_NAME_DISABLED}
-             COMMAND ${FALSE_BIN}
-    )
+    add_test(NAME ${WEBUI_TEST_PREFIX}${TEST_NAME_DISABLED} COMMAND false)
     set_tests_properties(
       ${WEBUI_TEST_PREFIX}${TEST_NAME_DISABLED} PROPERTIES DISABLED true
     )

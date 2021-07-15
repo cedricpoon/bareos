@@ -1,15 +1,16 @@
 #!/bin/bash
 set -e
+set -o pipefail
 set -u
 #
 TestName="$(basename "$(pwd)")"
 export TestName
 
-JobName=backup-bareos-fd
 #shellcheck source=../environment.in
 . ./environment
+#shellcheck source=environment-local.in
+. ./environment-local
 
-JobName=backup-bareos-fd
 #shellcheck source=../scripts/functions
 . "${rscripts}"/functions
 "${rscripts}"/cleanup
@@ -23,37 +24,35 @@ start_test
 
 start_bareos
 
-#run_python_unittests "$@"
 function endpoint_check {
-# $1: method
-# $2: endpoint-url
+# $1: method (POST, GET)
+# $2: endpoint_url
 # $3: string to grep for
 # $4: extra curl options
 # $5: repeat n times with a pause of 1 second between tries to get the result
 
-if [ -z "$5" ]; then
-    maxTry=1
-else
-    maxTry=$5
-fi
+method="$1"
+endpoint_url="$2"
+search="$3"
+curl_extra_options="${4:-}"
+maxTry=${5:-1}
 
-url="http://127.0.0.1:@restapi_port@/$2"
-echo "curl -w \"\n%{http_code}\n\" -s -X $1 $url -H \"accept: application/json\" -H  \"Authorization: Bearer $TOKEN\" \"$4\" " >> ${tmp}/../log/curl.log
+url="${REST_API_URL}/$2"
+echo "curl -w \"\n%{http_code}\n\" -s -X $1 $url -H \"Content-Type: application/json\"
+ -H \"accept: application/json\" -H  \"Authorization: Bearer $TOKEN\" \"$curl_extra_options\" " >> ${tmp}/../log/curl.log
 # curl doesn't like empty string "" as option, will exit with code 3
 i=0
 found="false"
-while [ $i -lt $maxTry ] && [ $found == "false" ]
-do
-    if [ -z "$4" ]
-    then
-        curl -w "\n%{http_code}\n" -s -X $1 $url -H "accept: application/json" -H  "Authorization: Bearer $TOKEN" > ${tmp}/curl.out
+while [ $i -lt $maxTry ] && [ $found == "false" ]; do
+    if [ -z "$curl_extra_options" ]; then
+        curl -w "\n%{http_code}\n" -s -X $1 $url -H "Content-Type: application/json" -H "accept: application/json" -H  "Authorization: Bearer $TOKEN" > ${tmp}/curl.out
     else
-        curl -w "\n%{http_code}\n" -s -X $1 $url -H "accept: application/json" -H  "Authorization: Bearer $TOKEN" "$4" > ${tmp}/curl.out
+        curl -w "\n%{http_code}\n" -s -X $1 $url -H "Content-Type: application/json" -H "accept: application/json" -H  "Authorization: Bearer $TOKEN" "$curl_extra_options" > ${tmp}/curl.out
     fi
     cat ${tmp}/curl.out >> ${tmp}/../log/curl.log
-    echo "Search for \"$3\"" >> ${tmp}/../log/curl.log
+    echo "Search for \"$search\"" >> ${tmp}/../log/curl.log
     set +e
-    grep -q "$3" ${tmp}/curl.out
+    grep -q "$search" ${tmp}/curl.out
     resultCode=$?
     set -e
     echo $resultCode >> ${tmp}/../log/curl.log
@@ -79,14 +78,12 @@ done
 ## TODO: error handling / make sure api gets stopped
 mkdir -p etc/bareos/bareos-dir.d/schedule
 mkdir -p etc/bareos/bareos-dir.d/user
-cd api
-./startapi.sh
-sleep 3
-echo "api started"
-TOKEN=`curl -X POST "http://127.0.0.1:@restapi_port@/token" -H  "accept: application/json" -H  "Content-Type: application/x-www-form-urlencoded" -d "grant_type=&username=admin-tls&password=secret&scope=&client_id=&client_secret=" | grep access_token | cut -d '"' -f 4`
-#echo $TOKEN
-endpoint_check POST "configuration/clients" newClient.$$ "-d {\"name\":\"newClient.$$-fd\",\"address\": \"127.0.0.1\", \"password\": \"string\"}" 1
+
+api/restapi.sh start
+
+TOKEN=$(api/curl-auth.sh)
 endpoint_check GET "configuration/clients/bareos-fd" bareos-fd "" 1
+endpoint_check POST "configuration/clients" newClient.$$ "-d {\"name\":\"newClient.$$-fd\", \"address\": \"127.0.0.1\", \"password\": \"string\"}" 1
 endpoint_check GET "configuration/clients" newClient "" 1
 endpoint_check GET "configuration/jobs" backup-bareos-fd "" 1
 endpoint_check GET "configuration/jobs/backup-bareos-fd" backup-bareos-fd "" 1
@@ -121,7 +118,7 @@ endpoint_check POST "control/jobs/run" jobid "-d {\"jobControl\":{\"job\":\"back
 endpoint_check PUT "control/jobs/cancel/2" 200 "" 1
 endpoint_check POST "control/jobs/rerun/2" "jobid" "" 1
 # try non-existing job
-endpoint_check GET "control/jobs/26544" "not found" "" 1
+endpoint_check GET "control/jobs/999999" "not found" "" 1
 endpoint_check GET "control/jobs/1" "jobstatus" "" 1
 endpoint_check GET "control/jobs/totals" "jobs" "" 1
 endpoint_check GET "control/jobs" "jobs" "" 1
@@ -130,7 +127,6 @@ endpoint_check GET "control/jobs/files/1" "filenames" "" 1
 # sometimes Full hasn't finished, we retry until restore works
 sleep 3
 endpoint_check POST "control/jobs/restore" "jobid" "-d {\"jobControl\":{\"client\":\"bareos-fd\",\"selectAllDone\":\"yes\"}}" 10
-# TODO: loop here until jobid 1 has finished instead of sleep
 # TODO: loop here until jobid 1 has finished instead of sleep
 endpoint_check DELETE "control/jobs/1" "deleted" "" 1
 endpoint_check DELETE "control/jobs/63535" "No job" "" 1
@@ -148,8 +144,7 @@ endpoint_check GET "control/directors/version" "bareos-dir" "" 1
 endpoint_check GET "control/directors/time" "year" "" 1
 endpoint_check PUT "control/directors/reload" "success" "" 1
 
-./stopapi.sh
-cd -
+api/restapi.sh stop
 
 #check_for_zombie_jobs storage=File client=bareos-fd
 

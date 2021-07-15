@@ -30,6 +30,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field, PositiveInt
 from enum import Enum
+import os
 import pathlib
 from packaging import version
 import bareos.bsock
@@ -52,7 +53,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = config.getint("JWT", "access_token_expire_minutes"
 userDirectors = {}
 users_db = {}
 
-with open("metatags.yaml", "r") as stream:
+with open(os.path.dirname(os.path.realpath(__file__)) + "/metatags.yaml", "r") as stream:
     tags_metadata = yaml.safe_load(stream)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

@@ -29,7 +29,7 @@ def get_version():
     base_dir = os.path.abspath(os.path.dirname(__file__))
 
     try:
-        with open(os.path.join(base_dir, "bareosRestapiModels", "VERSION.txt")) as version_file:
+        with open(os.path.join(base_dir, "bareos_restapi", "VERSION.txt")) as version_file:
             # read version
             # and adapt it according to
             # https://www.python.org/dev/peps/pep-0440/.
@@ -45,25 +45,18 @@ def get_version():
 
 
 setup(
-    name="python-bareos-restapi",
-    # name="bareosRestapiModels",
+    name="bareos-restapi",
     version=get_version(),
     license="AGPLv3",
     author="Bareos Team",
     author_email="packager@bareos.com",
-    # include_package_data=True,
-    # package_dir={"": "src"},
-    # py_modules=["bareosRestapiModels"],
     packages=find_packages(),
-    # packages=find_packages(where="src"),
-    # packages=["bareosRestapiModels"],
-    # scripts=["src/bareos-restapi.py"],
-    package_data={  # Optional
-        "bareosRestapiModels": [
-            "bareos-restapi.py",
+    package_data={
+        "bareos_restapi": [
             "metatags.yaml",
             "openapi.json",
-            "api.ini.sample",
+            "api.ini.example",
+            "VERSION.txt",
         ],
     },
     # data_files=[('etc/bareos/restapi',['etc/restapi.ini'])],
@@ -73,25 +66,19 @@ setup(
     description="REST API for Bareos console access.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    # Python 2.6 is used by RHEL/Centos 6.
-    # When RHEL/Centos 6 is no longer supported (End of 2020),
-    # Python 2.6 will no longer be supported by python-bareos.
     python_requires=">=3.6",
     install_requires=[
         "fastapi",
-        "dataclasses",
-        "fastapi",
-        "pydantic",
-        "python-bareos>=20.0.0",
-        "starlette==0.13.6",
-        "python-jose",
-        "uvicorn",
-        "python-multipart",
-        "passlib",
         "packaging",
+        "passlib",
+        "pydantic",
+        "python-bareos",
+        "python-jose",
+        # python-multipart: used by fastapi
+        "python-multipart",
         "pyyaml",
+        "uvicorn",
     ],
-    extras_require={"TLS-PSK": ["sslpsk"]},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "License :: OSI Approved :: GNU Affero General Public License v3",

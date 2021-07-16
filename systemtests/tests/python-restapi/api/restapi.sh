@@ -8,9 +8,9 @@ cd $(dirname "$BASH_SOURCE")
 . ../environment-local
 
 if [ "${PYTHONPATH:-}" ]; then
-    export PYTHONPATH=${CMAKE_SOURCE_DIR}/rest-api/bareosRestapiModels/:$PYTHONPATH
+    export PYTHONPATH=${CMAKE_SOURCE_DIR}/rest-api/:$PYTHONPATH
 else
-    export PYTHONPATH=${CMAKE_SOURCE_DIR}/rest-api/bareosRestapiModels/
+    export PYTHONPATH=${CMAKE_SOURCE_DIR}/rest-api/
 fi
 
 start()
@@ -22,7 +22,7 @@ start()
         exit 1
     fi
 
-    $PYTHON_EXECUTABLE -m uvicorn bareos-restapi:app --port ${REST_API_PORT} > ../log/bareos-restapi.log 2>&1 &
+    $PYTHON_EXECUTABLE -m uvicorn bareos_restapi:app --port ${REST_API_PORT} > ../log/bareos-restapi.log 2>&1 &
     PID=$!
     
     WAIT=10

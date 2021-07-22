@@ -352,7 +352,7 @@ class BareosFdPluginOvirt(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
             if not restorepkt.ofname.endswith(".ovf"):
                 FNAME = StringCodec.decode_fname(restorepkt.ofname)
 
-                disk = self.ovirt.get_vm_disk_by_basename(FNAME)
+                disk, nb_flag = self.ovirt.get_vm_disk_by_basename(FNAME)
                 if disk is None:
                     bareosfd.JobMessage(
                         bareosfd.M_ERROR,
@@ -361,6 +361,42 @@ class BareosFdPluginOvirt(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
                     )
                     return bareosfd.bRC_Error
                 else:
+                    # Non base image
+                    if nb_flag:
+                        self.ovirt.wait_for_disk_unlock(disk.id)
+
+                        # Get description for restoring snapshot and increment on snapshot indicator
+                        # Files for snapshot in XML are ordered by time sequence
+                        snap_desc = self.ovirt.snapshots_layer_queue[0][0]["snapshot-description"]
+
+                        if (self.ovirt.basename not in self.ovirt.recovered_snapshots):
+                            self.ovirt.create_vm_snapshot(
+                                snap_desc,
+                                (
+                                    "Restore of virtual machine '%s' using snapshot '%s' is "
+                                    "starting." % (self.ovirt.vm.name, snap_desc)
+                                )
+                            )
+                        else:
+                            bareosfd.DebugMessage(
+                                150,
+                                "BareosFdPluginOvirt:create_file(): vm snapshot '%s' exists, skipping creation.\n"
+                                % snap_desc
+                            )
+                    # Base image
+                    else:
+                        # Add to recovered snapshots
+                        self.ovirt.recovered_snapshots.append(self.ovirt.basename)
+                        
+                        ovf_disk = self.ovirt.get_ovf_disk_from_basename(self.ovirt.basename)
+
+                        # Append to queue for creation of regarding snapshot
+                        if ovf_disk["vm_snapshot_id"] not in [ovfd[0]["vm_snapshot_id"] for ovfd in self.ovirt.snapshots_layer_queue]:
+                            
+                            ovf_snap_disks = self.ovirt.get_ovf_disks_from_snapshot_id(ovf_disk["vm_snapshot_id"])
+
+                            self.ovirt.snapshots_layer_queue.append(ovf_snap_disks)
+
                     self.ovirt.start_upload(disk)
 
         if restorepkt.type == bareosfd.FT_REG:
@@ -659,7 +695,11 @@ class BareosFdPluginOvirt(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
             100, "ROP.object(%s): %s\n" % (type(ROP.object), ROP.object)
         )
         ro_data = json.loads(str(StringCodec.decode_object_data(ROP.object)))
-        self.ovirt.disk_metadata_by_id[ro_data["disk_metadata"]["id"]] = ro_data[
+
+        # disk_metadata_by_id key as basename for supporting multiple snapshots
+        self.ovirt.disk_metadata_by_id[
+            os.path.basename(os.path.splitext(ROP.object_name)[0])
+        ] = ro_data[
             "disk_metadata"
         ]
 
@@ -770,6 +810,10 @@ class BareosOvirtWrapper(object):
 
         self.snapshot_remove_timeout = 300
 
+        self.basename = None
+        self.recovered_snapshots = []
+        self.snapshots_layer_queue = []
+
     def set_options(self, options):
         # make the plugin options also available in this class
         self.options = options
@@ -860,16 +904,6 @@ class BareosOvirtWrapper(object):
             # Locate the service that manages the virtual machine:
             self.vm_service = self.vms_service.vm_service(self.vm.id)
 
-            # check if vm have snapshots
-            snaps_service = self.vm_service.snapshots_service()
-            if len(snaps_service.list()) > 1:
-                bareosfd.JobMessage(
-                    bareosfd.M_FATAL,
-                    "Error '%s' already has %d snapshots. This is not supported\n"
-                    % (self.vm.name, len(snaps_service.list()) - 1),
-                )
-                return bareosfd.bRC_Error
-
             bareosfd.DebugMessage(100, "Start the backup of VM %s\n" % (self.vm.name))
 
             # Save the OVF to a file, so that we can use to restore the virtual
@@ -889,8 +923,22 @@ class BareosOvirtWrapper(object):
                 }
             )
 
+            # Prepare ovf object for parsing ovf_data
+            # in order to retrieve snapshot disk order
+            self.ovf = Ovf(ovf_data)
+            self.prepare_restore_objects()
+
             # create vm snapshots
-            self.create_vm_snapshot()
+            self.create_vm_snapshot(
+                # Create an unique description for the snapshot, so that it is easier
+                # for the administrator to identify this snapshot as a temporary one
+                # created just for backup purposes:
+                "%s-backup-%s" % (self.vm.name, uuid.uuid4()),
+                (
+                    "Backup of virtual machine '%s' using snapshot '%s' is "
+                    "starting." % (self.vm.name, "%s-backup-%s" % (self.vm.name, uuid.uuid4()))
+                )
+            )
 
             # get vm backup disks from snapshot
             if not self.all_disks_excluded and not self.get_vm_backup_disks():
@@ -917,15 +965,10 @@ class BareosOvirtWrapper(object):
                 return True
         return False
 
-    def create_vm_snapshot(self):
+    def create_vm_snapshot(self, snapshot_description, event_description):
         """
         Creates a snapshot
         """
-
-        # Create an unique description for the snapshot, so that it is easier
-        # for the administrator to identify this snapshot as a temporary one
-        # created just for backup purposes:
-        snap_description = "%s-backup-%s" % (self.vm.name, uuid.uuid4())
 
         # Send an external event to indicate to the administrator that the
         # backup of the virtual machine is starting. Note that the description
@@ -938,10 +981,7 @@ class BareosOvirtWrapper(object):
                 origin=APPLICATION_NAME,
                 severity=types.LogSeverity.NORMAL,
                 custom_id=self.event_id,
-                description=(
-                    "Backup of virtual machine '%s' using snapshot '%s' is "
-                    "starting." % (self.vm.name, snap_description)
-                ),
+                description=event_description,
             ),
         )
         self.event_id += 1
@@ -951,10 +991,10 @@ class BareosOvirtWrapper(object):
         # wait till the snapshot is completely created.
         # The snapshot will not include memory. Change to True the parameter
         # persist_memorystate to get it (in that case the VM will be paused for a while).
-        snaps_service = self.vm_service.snapshots_service()
+        snaps_service = self.vms_service.vm_service(self.vm.id).snapshots_service()
         snap = snaps_service.add(
             snapshot=types.Snapshot(
-                description=snap_description,
+                description=snapshot_description,
                 persist_memorystate=False,
                 disk_attachments=self.get_vm_disks_for_snapshot(),
             ),
@@ -983,11 +1023,30 @@ class BareosOvirtWrapper(object):
 
         bareosfd.JobMessage(bareosfd.M_INFO, "'  The snapshot is now complete.\n")
 
+    def get_ovf_snapshot_furthest_distance(self, ovf_list, snapshot_id):
+        """
+        Get furthest distance for disk with same snapshot id
+        """
+        c = -1
+        dist = -1
+        for d in ovf_list:
+            if c != -1:
+                c += 1
+            if snapshot_id == d["vm_snapshot_id"]:
+                if dist < c:
+                    dist = c
+                # Start counting
+                c = 0
+        if dist == -1:
+            return 1
+        else:
+            return dist
+
     def get_vm_disks_for_snapshot(self):
         # return list of disks for snapshot, process include/exclude if given
-        disk_attachments_service = self.vm_service.disk_attachments_service()
+        disk_attachments_service = self.vms_service.vm_service(self.vm.id).disk_attachments_service()
         disk_attachments = disk_attachments_service.list()
-        included_disk_ids = []
+        included_disks_obj = []
         included_disks = None
         for disk_attachment in disk_attachments:
             disk = self.connection.follow_link(disk_attachment.disk)
@@ -997,9 +1056,9 @@ class BareosOvirtWrapper(object):
             if self.is_disk_alias_excluded(disk.alias):
                 continue
 
-            included_disk_ids.append(disk.id)
+            included_disks_obj.append(disk)
 
-        if len(included_disk_ids) == 0:
+        if len(included_disks_obj) == 0:
             # No disks to backup, snapshot will only contain VM config
             # Note: The comma must not be omitted here:
             # included_disks = (types.DiskAttachment(),)
@@ -1011,10 +1070,55 @@ class BareosOvirtWrapper(object):
             included_disks = [types.DiskAttachment()]
 
         else:
-            included_disks = [
-                types.DiskAttachment(disk=types.Disk(id=disk_id))
-                for disk_id in included_disk_ids
-            ]
+            # Backup case
+            if len(self.recovered_snapshots) == 0:
+                included_disks = [
+                    types.DiskAttachment(disk=types.Disk(id=disk_obj.id, image_id=self.basename))
+                    for disk_obj in included_disks_obj
+                ]
+            # Recovery case
+            else:
+                # Dequeue snapshot layer
+                layer = self.snapshots_layer_queue.pop(0)
+
+                layer_fill = self.restore_objects[len(self.recovered_snapshots):len(self.recovered_snapshots) + len(layer)]
+
+                image_ids = [x["diskId"] for x in layer_fill]
+
+                # For excluding non included disks
+                aliases = [x["disk-alias"] for x in layer_fill]
+
+                _list_ = [o for a in aliases for o in included_disks_obj if o.alias == a]
+
+                included_disks_obj = _list_
+
+                included_disks = [
+                    types.DiskAttachment(disk=types.Disk(id=disk_obj.id, image_id=image_ids[i]))
+                    for i, disk_obj in enumerate(included_disks_obj)
+                ]
+
+                for i, disk_obj in enumerate(included_disks_obj):
+                    bareosfd.DebugMessage(
+                        150,
+                        "get_vm_disks_for_snapshot(): DiskAttachment(id=%s, image_id=%s)\n"
+                        % (disk_obj.id, image_ids[i]),
+                    )
+
+                # Record recovered images for skipping
+                self.recovered_snapshots += image_ids
+
+                # Enqueue for each layer_fill
+                for ld in layer_fill:
+                    if  (
+                            ld["vm_snapshot_id"] not in [ovfd[0]["vm_snapshot_id"] for ovfd in self.snapshots_layer_queue] and
+                            # check if snapshots are adjacent to each other
+                            self.get_ovf_snapshot_furthest_distance(self.restore_objects, ld["vm_snapshot_id"]) == 1
+                        ):
+
+                        # Enqueue new layers, depending on current restoring layer items
+                        _disk_ = self.get_ovf_disks_from_snapshot_id(ld["vm_snapshot_id"])
+
+                        self.snapshots_layer_queue.append(_disk_)
 
         return included_disks
 
@@ -1035,7 +1139,15 @@ class BareosOvirtWrapper(object):
         snap_disks_service = self.snap_service.disks_service()
         snap_disks = snap_disks_service.list()
 
-        # download disk snapshot
+        bareosfd.DebugMessage(
+            100,
+            "get_vm_backup_disks(): snap_disks: [%s]\n"
+            % ','.join(x.image_id for x in snap_disks),
+        )
+
+        backup_obj_queue = []
+
+        # download disk snaphost
         for snap_disk in snap_disks:
             disk_id = snap_disk.id
             disk_alias = snap_disk.alias
@@ -1064,7 +1176,8 @@ class BareosOvirtWrapper(object):
             # Download disk snapshot
             if len(disk_snapshots) > 0:
                 for disk_snapshot in disk_snapshots:
-                    self.backup_objects.append(
+                    # Queue up backup_objects
+                    backup_obj_queue.append(
                         {
                             "vmname": self.vm.name,
                             "vmid": self.vm.id,
@@ -1073,6 +1186,16 @@ class BareosOvirtWrapper(object):
                         }
                     )
                 has_disks = True
+
+        # Sort order of disk snapshots based on .ovf <Disk />
+        self.backup_objects += [s for x in self.restore_objects for s in backup_obj_queue if x["diskId"] == s["snapshot"].id]
+
+        bareosfd.JobMessage(
+            bareosfd.M_INFO,
+            "Backup objects order as followings: [%s]\n"
+            % ','.join(x["snapshot"].id for x in self.backup_objects if "snapshot" in x),
+        )
+
         return has_disks
 
     def is_disk_alias_included(self, disk_alias):
@@ -1138,6 +1261,8 @@ class BareosOvirtWrapper(object):
         return HTTPSConnection(proxy_url.hostname, proxy_url.port, context=sslcontext)
 
     def start_download(self, snapshot, disk):
+        # Prevent disk lock error
+        self.wait_for_disk_unlock(disk.id)
 
         bareosfd.JobMessage(
             bareosfd.M_INFO,
@@ -1234,6 +1359,155 @@ class BareosOvirtWrapper(object):
 
         return chunk
 
+    def parse_ovf_files(self):
+        ovf_files = []
+
+        for file_element in self.ovf.get_elements("file_elements"):
+            # Get file properties:
+            props = {}
+            for key, value in file_element.items():
+                key = key.replace("{%s}" % self.ovf.OVF_NAMESPACES["ovf"], "")
+                props[key] = value
+            ovf_files.append(props)
+        
+        return ovf_files
+
+    def parse_ovf_snapshots(self):
+        ovf_snapshots = []
+
+        for snapshot_objects in self.ovf.get_elements("snapshot_elements"):
+            # Get snapshot properties:
+            props = {}
+            for key, value in snapshot_objects.items():
+                key = key.replace("{%s}" % self.ovf.OVF_NAMESPACES["ovf"], "")
+                props[key] = value
+            ovf_snapshots.append(props)
+
+        return ovf_snapshots
+
+    def parse_ovf_disks(self):
+        ovf_disks = []
+
+        for disk_element in self.ovf.get_elements("disk_elements"):
+            # Get disk properties:
+            props = {}
+            for key, value in disk_element.items():
+                key = key.replace("{%s}" % self.ovf.OVF_NAMESPACES["ovf"], "")
+                props[key] = value
+                
+            ovf_disks.append(props)
+
+        return ovf_disks
+
+    def prepare_restore_objects(self, storage_domain=None):
+
+        # Parse OVF for Disks, Snapshots and Files
+        disks_ul = self.parse_ovf_disks()
+        snapshots = self.parse_ovf_snapshots()
+        files = self.parse_ovf_files()
+
+        disks = disks_ul
+
+        # Put ACTIVE image at last
+        snapshots.append(snapshots.pop(0))
+
+        lx = [] # Parallel array for disks in snapshot order
+        ly = [] # Parallel array for files in snapshot order
+        lz = [] # Positions for base images
+
+        # Sort restore objects with timestamp
+        for snap in snapshots:
+            _prev_f_ = None
+            for disk, f in zip(disks[::-1], files[::-1]):
+                if disk["vm_snapshot_id"] == snap["id"]:
+                    # If first file of next disk then it is base image
+                    if _prev_f_ is None or _prev_f_["href"].split("/")[0] != f["href"].split("/")[0]:
+                        lz.append(len(lx))
+
+                    lx.append(disk)
+                    ly.append(f)
+                _prev_f_ = f
+        disks = lx
+        files = ly
+
+        # Add extra details to disks
+        for disk, f in zip(disks, files):
+            disk["snapshot-description"] = f["description"]
+            disk["storage_domain"] = storage_domain
+
+        lx = [] # base images
+        ly = [] # incremental layers
+
+        # Sink raw image
+        for i, disk in enumerate(disks):
+            if i in lz:
+                lx.append(disk)
+            else:
+                ly.append(disk)
+
+        self.restore_objects = lx
+
+        layers = []
+        for x in lx:
+            if x["vm_snapshot_id"] not in [l[0]["vm_snapshot_id"] for l in layers]:
+                layers.append([d for d in disks if d["vm_snapshot_id"] == x["vm_snapshot_id"]])
+
+        # Circuit breaker for infinite loop in while dead case
+        cb_flag = 0
+
+        # Complete cow images by finding relative layer fill
+        while len(ly) > 1:
+            lz = []
+            layer_aliases = [x["disk-alias"] for x in layers.pop(0)]
+
+            # find regarding layer as lz
+            for y in ly:
+                if y["disk-alias"] in layer_aliases:
+                    lz.append(y)
+                    layer_aliases.remove(y["disk-alias"])
+
+            # Remove lz from ly
+            for y in lz:
+                # Reset circuit breaker
+                cb_flag = 0
+                ly.remove(y)
+
+            self.restore_objects += lz
+            cb_flag += 1
+
+            for z in lz:
+                if  (
+                        z["vm_snapshot_id"] not in [l[0]["vm_snapshot_id"] for l in layers] and
+                        # check if snapshots are adjacent to each other
+                        self.get_ovf_snapshot_furthest_distance(ly, z["vm_snapshot_id"]) == 1
+                    ):
+
+                    # Enqueue next layer
+                    layers.append([d for d in disks if d["vm_snapshot_id"] == z["vm_snapshot_id"]])
+
+            # Circuit break
+            if cb_flag > 50:
+                bareosfd.JobMessage(
+                    bareosfd.M_FATAL,
+                    "Dead loop in restore object construction.\n",
+                )
+                raise ArithmeticError('Breaking circuit')
+        
+        self.restore_objects += ly
+
+        # Validate self.restore_objects contains all disk
+        for od in disks_ul:
+            err_flg = True
+            for ro in self.restore_objects:
+                if od["diskId"] == ro["diskId"]:
+                    err_flg = False
+            if err_flg:
+                bareosfd.JobMessage(
+                    bareosfd.M_FATAL,
+                    "Distortion in ordering of restore objects.\n",
+                )
+                raise ArithmeticError('Exceptional disk ordering [%s]' % ','.join(x["diskId"] for x in self.restore_objects))
+
     def prepare_vm_restore(self):
         restore_existing_vm = False
         if self.connection is None:
@@ -1319,34 +1593,20 @@ class BareosOvirtWrapper(object):
                 self.create_vm(vm_name, cluster_name)
                 self.add_nics_to_vm()
 
-            # Extract disk information from OVF
-            disk_elements = self.ovf.get_elements("disk_elements")
+            self.prepare_restore_objects(storage_domain)
 
-            if self.restore_objects is None:
-                self.restore_objects = []
-
-            for disk_element in disk_elements:
-                # Get disk properties:
-                props = {}
-                for key, value in disk_element.items():
-                    key = key.replace("{%s}" % self.ovf.OVF_NAMESPACES["ovf"], "")
-                    props[key] = value
-
-                # set storage domain
-                props["storage_domain"] = storage_domain
-                self.restore_objects.append(props)
-
+            for disk in self.parse_ovf_disks():
                 # used by get_ovf_disk_alias_by_basename(), needed to process
                 # includes/excludes on restore
                 self.ovf_disks_by_alias_and_fileref[
-                    props["disk-alias"] + "-" + props["fileRef"]
-                ] = props
+                    disk["disk-alias"] + "-" + disk["fileRef"]
+                ] = disk
 
                 if restore_existing_vm:
                     # When restoring to existing VM, old and new disk ID are identical
                     # Important: The diskId property in the OVF is not the oVirt
                     # diskId, which can be found in the first part of the OVF fileRef
-                    old_disk_id = os.path.dirname(props["fileRef"])
+                    old_disk_id = os.path.dirname(disk["fileRef"])
                     self.old_new_ids[old_disk_id] = old_disk_id
 
             bareosfd.DebugMessage(
@@ -1510,6 +1770,20 @@ class BareosOvirtWrapper(object):
 
         return self.ovf_disks_by_alias_and_fileref[relname]["disk-alias"]
 
+    def get_ovf_disks_from_snapshot_id(self, sid):
+        """
+        Return all disks object with the same snapshot id
+        """
+
+        return [d for d in self.restore_objects if d["vm_snapshot_id"] == sid]
+
+    def get_ovf_disk_from_basename(self, basename):
+        ret = [d for d in self.restore_objects if d["diskId"] == basename]
+        if len(ret) > 0:
+            return ret[0]
+        else:
+            return None
+
     def get_vm_disk_by_basename(self, fname):
 
         dirpath = os.path.dirname(fname)
@@ -1518,6 +1792,7 @@ class BareosOvirtWrapper(object):
         relname = "%s/%s" % (dirname, basename)
 
         found = None
+        nb_flag = False
         bareosfd.DebugMessage(
             200,
             "get_vm_disk_by_basename(): %s %s\n" % (basename, self.restore_objects),
@@ -1536,6 +1811,8 @@ class BareosOvirtWrapper(object):
                     bareosfd.DebugMessage(
                         200, "get_vm_disk_by_basename(): lookup matched\n"
                     )
+                    # Set self.basename for self.disk_metadata_by_id query
+                    self.basename = basename
                     old_disk_id = os.path.dirname(obj["fileRef"])
 
                     new_disk_id = None
@@ -1547,25 +1824,22 @@ class BareosOvirtWrapper(object):
                         )
                         new_disk_id = self.old_new_ids[old_disk_id]
 
-                    # get base disks
-                    if not obj["parentRef"]:
-                        disk = self.get_or_add_vm_disk(obj, new_disk_id)
+                    # Set non base disks flag
+                    if obj["parentRef"]:
+                        nb_flag = True
 
-                        if disk is not None:
-                            new_disk_id = disk.id
-                            self.old_new_ids[old_disk_id] = new_disk_id
-                            found = disk
-                    else:
-                        bareosfd.JobMessage(
-                            bareosfd.M_WARNING,
-                            "The backup have snapshots and only base will be restored\n",
-                        )
+                    disk = self.get_or_add_vm_disk(obj, new_disk_id)
+
+                    if disk is not None:
+                        new_disk_id = disk.id
+                        self.old_new_ids[old_disk_id] = new_disk_id
+                        found = disk
 
                 i += 1
         bareosfd.DebugMessage(
             200, "get_vm_disk_by_basename(): found disk %s\n" % (found)
         )
-        return found
+        return found, nb_flag
 
     def get_or_add_vm_disk(self, obj, disk_id=None):
         # Create the disks:
@@ -1621,17 +1895,17 @@ class BareosOvirtWrapper(object):
                 disk_bootable = False
                 if "boot" in obj:
                     if obj["boot"] == "true":
-                        disk_bootable = True
+                        disk_bootable = True   
 
                 #####
                 # Use the "add" method of the disk attachments service to add the disk.
                 # Note that the size of the disk, the `provisioned_size` attribute, is
                 # specified in bytes, so to create a disk of 10 GiB the value should
                 # be 10 * 2^30.
-                disk_attachment = disk_attachments_service.add(
-                    types.DiskAttachment(
-                        disk=types.Disk(
+                disk = disks_service.add(
+                    types.Disk(
                             id=disk_id,
+                            image_id=self.basename,
                             name=disk_alias,
                             description=description,
                             format=disk_format,
@@ -1639,23 +1913,39 @@ class BareosOvirtWrapper(object):
                             initial_size=actual_size,
                             sparse=disk_format == types.DiskFormat.COW,
                             storage_domains=[types.StorageDomain(name=storage_domain)],
-                        ),
-                        interface=disk_interface,
-                        bootable=disk_bootable,
-                        active=True,
                     ),
                 )
 
                 # 'Waiting for Disk creation to finish'
-                disk_service = disks_service.disk_service(disk_attachment.disk.id)
+                disk_service = disks_service.disk_service(disk.id)
                 while True:
                     time.sleep(5)
                     disk = disk_service.get()
                     if disk.status == types.DiskStatus.OK:
                         time.sleep(5)
                         break
+                
+                disk_attachments_service.add(
+                    types.DiskAttachment(
+                        disk=disk,
+                        interface=disk_interface,
+                        bootable=disk_bootable,
+                        active=True,
+                    ),
+                )
 
         return disk
+                
+    def wait_for_disk_unlock(self, diskId):
+        disks_service = self.system_service.disks_service()
+
+        disk_service = disks_service.disk_service(diskId)
+        while True:
+            time.sleep(5)
+            disk = disk_service.get()
+            if disk.status == types.DiskStatus.OK:
+                time.sleep(5)
+                break
 
     def start_upload(self, disk):
 
@@ -1688,9 +1978,9 @@ class BareosOvirtWrapper(object):
         # will be sent must be used, we call it effective_size here. It was
         # saved at backup time in restoreobjects, see start_backup_file(),
         # and restoreobjects are restored before any file.
-        new_old_ids = {v: k for k, v in self.old_new_ids.items()}
-        old_id = new_old_ids[disk.id]
-        effective_size = self.disk_metadata_by_id[old_id]["effective_size"]
+
+        # Updated to use self.basename as key for query
+        effective_size = self.disk_metadata_by_id[self.basename]["effective_size"]
         self.init_bytes_to_transf = self.bytes_to_transf = effective_size
 
         content_range = "bytes %d-%d/%d" % (
@@ -1882,6 +2172,8 @@ class Ovf(object):
             './Content[@xsi:type="ovf:VirtualSystem_Type"]/Section[@xsi:type="ovf:VirtualHardwareSection_Type"]/Item[Type="interface"]'
         ],
         "disk_elements": ['./Section[@xsi:type="ovf:DiskSection_Type"]/Disk'],
+        "file_elements": ['./References/File'],
+        "snapshot_elements": ['./Content[@xsi:type="ovf:VirtualSystem_Type"]/Section[@xsi:type="ovf:SnapshotsSection_Type"]/Snapshot'],
         "resources_elements": [
             './Content[@xsi:type="ovf:VirtualSystem_Type"]/Section[@xsi:type="ovf:VirtualHardwareSection_Type"]/Item[rasd:ResourceType="3"]',
             './Content[@xsi:type="ovf:VirtualSystem_Type"]/Section[@xsi:type="ovf:VirtualHardwareSection_Type"]/Item[rasd:ResourceType="4"]',
